@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+import base64, pickle, json
 from PyPDF2 import PdfReader
 from google.oauth2 import service_account
 from google.cloud import firestore
@@ -49,9 +50,9 @@ def get_firestore_db():
 
 def gmail_authenticate():
     """
-    Handles Google Authentication.
-    Returns (gmail_service, user_email) of the signed-in user.
-    Each user must go through OAuth — this ensures emails send from their account.
+    Handles Google Authentication (Streamlit Cloud compatible).
+    Uses console flow instead of opening a browser.
+    Returns (gmail_service, user_email).
     """
     db = get_firestore_db()
     creds = None
@@ -64,25 +65,37 @@ def gmail_authenticate():
 
         client_config = json.loads(client_secret_json)
         flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-        creds = flow.run_local_server(port=0)
 
-        service = build("gmail", "v1", credentials=creds)
-        profile = service.users().getProfile(userId="me").execute()
-        user_email = profile["emailAddress"]
+        st.info("Click the link below to log in to Google and paste the authorization code here 👇")
 
-        # Save token per user (optional, can just reauth every time)
-        if db:
-            token_b64 = base64.b64encode(pickle.dumps(creds)).decode("utf-8")
-            db.collection(DB_COLLECTION).document(user_email).set(
-                {"gmail_token": token_b64}, merge=True
-            )
+        auth_url, _ = flow.authorization_url(prompt='consent')
+        st.markdown(f"[🔑 Authorize with Google]({auth_url})")
 
-        return service, user_email
+        auth_code = st.text_input("Paste the authorization code here:")
+
+        if auth_code:
+            flow.fetch_token(code=auth_code)
+            creds = flow.credentials
+
+            service = build("gmail", "v1", credentials=creds)
+            profile = service.users().getProfile(userId="me").execute()
+            user_email = profile["emailAddress"]
+
+            # Save token in Firestore (optional)
+            if db:
+                token_b64 = base64.b64encode(pickle.dumps(creds)).decode("utf-8")
+                db.collection(DB_COLLECTION).document(user_email).set(
+                    {"gmail_token": token_b64}, merge=True
+                )
+
+            st.success(f"✅ Authenticated as {user_email}")
+            return service, user_email
+
+        return None, None
 
     except Exception as e:
         st.error(f"Authentication failed: {e}")
         return None, None
-
 # ================================
 # API & HELPER FUNCTIONS (No significant changes here)
 # ================================
