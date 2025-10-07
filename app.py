@@ -3,7 +3,6 @@ import base64
 import pickle
 from email.message import EmailMessage
 import pandas as pd
-import requests
 import streamlit as st
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -14,15 +13,19 @@ from google.oauth2 import service_account
 from google.cloud import firestore
 import json
 from datetime import datetime
+from openai import OpenAI  # <-- NEW: OpenAI import
 
 # ================================
 # SETUP & CONFIGURATION
 # ================================
 load_dotenv()
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+# --- NEW: Using OpenAI API Key ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 CSV_FILE = "Assistenzarzt_Jobs_CH__Combined_Final.csv"
 SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
-DB_COLLECTION = "job_applications_v2" # Using a new collection for the new data structure
+DB_COLLECTION = "job_applications_v2"
 DB_DOCUMENT_ID = "user_profile"
 
 # ================================
@@ -33,7 +36,7 @@ def get_firestore_db():
     try:
         firebase_creds_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
         if not firebase_creds_json:
-            st.error("Firebase service account JSON not found in environment variables.")
+            st.error("Firebase service account JSON not found.")
             return None
         creds_dict = json.loads(firebase_creds_json)
         creds = service_account.Credentials.from_service_account_info(creds_dict)
@@ -57,7 +60,7 @@ def gmail_authenticate():
         else:
             client_secret_json = os.getenv("GOOGLE_CLIENT_SECRET_JSON")
             if not client_secret_json:
-                st.error("Google client secret JSON not found. Cannot authenticate.")
+                st.error("Google client secret JSON not found.")
                 return None
             client_config = json.loads(client_secret_json)
             flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
@@ -72,29 +75,27 @@ def gmail_authenticate():
 # ================================
 # API & HELPER FUNCTIONS
 # ================================
-def call_deepseek_api(prompt, system_message="You are a helpful assistant."):
-    # ... (omitted for brevity, same as before)
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    data = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.5, "stream": False,
-    }
+def call_openai_api(prompt, system_message="You are a helpful assistant."):
+    """Generic function to call the OpenAI API."""
     try:
-        r = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=data)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error calling DeepSeek API: {e}")
+        if not OPENAI_API_KEY:
+            st.error("OpenAI API key is not configured. Please add it to your environment variables.")
+            return None
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.5,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        st.error(f"Error calling OpenAI API: {e}")
         return None
 
 def generate_personalized_email(job_title, hospital_name, canton, job_description, cv_content):
+    """Generates an email subject and body using OpenAI."""
     prompt = f"""
 Act as a professional medical career advisor in Switzerland.
 Your task is to create a compelling application email in German.
@@ -118,23 +119,21 @@ Your task is to create a compelling application email in German.
 3.  **Output Format:** Your final output MUST contain the subject and body separated by '|||'.
     Example: Betreff: Bewerbung als Assistenzarzt|||Sehr geehrte Damen und Herren,...
 """
-    response = call_deepseek_api(prompt, "You are a professional medical job applicant assistant, writing in German.")
+    response = call_openai_api(prompt, "You are a professional medical job applicant assistant, writing in German.")
     if response and '|||' in response:
         parts = response.split('|||', 1)
         subject = parts[0].replace('Betreff:', '').replace('Subject:', '').strip()
         body = parts[1].strip()
         return {'subject': subject, 'body': body}
+    
     return {'subject': f"Bewerbung als {job_title}", 'body': response or "Could not generate email body."}
 
-
 def translate_cv_text(text):
-    # ... (omitted for brevity, same as before)
     prompt = f"Please translate the following CV text from English to professional, high-quality German suitable for a medical job application in Switzerland.\n\n**Text to Translate:**\n---\n{text}\n---"
     system_message = "You are an expert translator specializing in medical and professional documents."
-    return call_deepseek_api(prompt, system_message)
+    return call_openai_api(prompt, system_message)
 
 def send_email_logic(service, to_email, subject, body, attachments):
-    # ... (omitted for brevity, same as before)
     try:
         message = EmailMessage()
         message.set_content(body)
@@ -155,10 +154,9 @@ def send_email_logic(service, to_email, subject, body, attachments):
         return False
 
 def extract_text_from_pdf(file):
-    # ... (omitted for brevity, same as before)
     try:
         reader = PdfReader(file)
-        text = "".join(page.extract_text() for page in reader.pages)
+        text = "".join(page.extract_text() for page in reader.pages if page.extract_text())
         return text
     except Exception as e:
         st.error(f"Error reading PDF file: {e}")
@@ -177,14 +175,12 @@ def update_user_data(db, data_to_update):
     db.collection(DB_COLLECTION).document(DB_DOCUMENT_ID).set(data_to_update, merge=True)
 
 def save_sent_email(db, email_data):
-    """Saves a record of the sent email to a subcollection."""
     if not db: return
     db.collection(DB_COLLECTION).document(DB_DOCUMENT_ID).collection("sent_emails").add(email_data)
 
 # ================================
 # UI PAGE FUNCTIONS
 # ================================
-
 def render_dashboard(db):
     st.header("📊 Dashboard: Sent Applications")
     emails_ref = db.collection(DB_COLLECTION).document(DB_DOCUMENT_ID).collection("sent_emails").order_by("sent_at", direction=firestore.Query.DESCENDING).stream()
@@ -216,24 +212,24 @@ def render_manual_job_page(db):
         job_description = st.text_area("Job Description", height=150)
         submitted = st.form_submit_button("Generate Email for this Job")
 
-    if submitted:
+    if submitted and all([job_title, hospital_name, contact_email]):
         st.session_state.manual_job_details = {
             "job_title": job_title, "hospital_name": hospital_name, "canton": canton,
             "contact_email": contact_email, "job_description": job_description
         }
-        with st.spinner("Generating email..."):
+        with st.spinner("Generating email with OpenAI..."):
             email_content = generate_personalized_email(
                 job_title, hospital_name, canton, job_description, st.session_state.cv_content
             )
             st.session_state.manual_email_content = email_content
+    elif submitted:
+        st.warning("Please fill in at least the Job Title, Hospital, and Email.")
 
     if 'manual_email_content' in st.session_state and st.session_state.manual_email_content:
         render_application_form(db, is_manual=True)
 
 def render_job_finder(db):
     st.header("🔍 Job Finder")
-    # ... The main job finding and application logic from Step 3 goes here ...
-    # This logic is largely the same, but calls the shared `render_application_form`
     try:
         jobs_df = pd.read_csv(CSV_FILE)
         user_data = get_user_data(db)
@@ -242,11 +238,9 @@ def render_job_finder(db):
         st.error(f"Error: '{CSV_FILE}' not found.")
         st.stop()
     
-    # Sidebar for stats is now part of the main app layout, not just this page
-    
     next_job = None
     for idx, row in jobs_df.iterrows():
-        if str(idx) not in applied_jobs and isinstance(row.get("Application Contact Email"), str) and "@" in row["Application Contact Email"]:
+        if str(idx) not in applied_jobs and isinstance(row.get("Application Contact Email"), str) and "@" in row.get("Application Contact Email", ""):
             next_job = (idx, row)
             break
             
@@ -258,13 +252,10 @@ def render_job_finder(db):
     
     if st.session_state.current_job_id != job_id:
         st.session_state.current_job_id = job_id
-        st.session_state.generated_email_content = None # Reset email content
-        # Populate session state for the application form
+        st.session_state.generated_email_content = None
         st.session_state.current_job_details = {
-            "job_id": job_id,
-            "job_title": row_data.get("job_title", "N/A"),
-            "hospital_name": row_data.get("hospital_name", ""),
-            "canton": row_data.get("canton", ""),
+            "job_id": job_id, "job_title": row_data.get("job_title", "N/A"),
+            "hospital_name": row_data.get("hospital_name", ""), "canton": row_data.get("canton", ""),
             "contact_email": str(row_data.get("Application Contact Email", "")).strip().split(",")[0],
             "application_url": row_data.get("Application URL", ""),
             "job_description": row_data.get("Job Description (short)", "")
@@ -277,7 +268,7 @@ def render_job_finder(db):
     col1, col2 = st.columns([3, 1])
     with col1:
         if st.button(f"🤖 Prepare Application for Job #{details['job_id']}"):
-             with st.spinner("Generating personalized email with DeepSeek..."):
+             with st.spinner("Generating personalized email with OpenAI..."):
                 email_content = generate_personalized_email(
                     details['job_title'], details['hospital_name'], details['canton'],
                     details['job_description'], st.session_state.cv_content
@@ -288,14 +279,13 @@ def render_job_finder(db):
             update_user_data(db, {"applied_jobs": firestore.ArrayUnion([str(details['job_id'])])})
             db.collection(DB_COLLECTION).document(DB_DOCUMENT_ID).update({f'stats.skipped_count': firestore.Increment(1)})
             st.warning(f"Skipped job #{details['job_id']}. Moving to next.")
-            st.session_state.current_job_id = None # Force reload of next job
+            st.session_state.current_job_id = None
             st.rerun()
 
     if st.session_state.get('generated_email_content'):
         render_application_form(db)
 
 def render_application_form(db, is_manual=False):
-    """A shared component for sending emails for both CSV and manual jobs."""
     st.markdown("---")
     st.subheader("✉️ Review, Edit, and Send Application")
 
@@ -309,44 +299,32 @@ def render_application_form(db, is_manual=False):
         form_key = f"form_{details['job_id']}"
 
     with st.form(key=form_key):
-        # --- NEW: Editable Fields ---
         contact_email = st.text_input("To (Contact Email)", value=details.get('contact_email', ''))
         subject = st.text_input("Subject", value=email_content.get('subject', ''))
         body = st.text_area("Email Body", value=email_content.get('body', ''), height=350)
         
-        # --- NEW: Attachment Management ---
         st.markdown("**Attachments**")
+        st.info("Manage attachments outside this form. New uploads will be added upon sending.")
         
-        # Display current attachments with a remove button
-        if st.session_state.attachments:
-            for i, attached_file in enumerate(st.session_state.attachments):
-                c1, c2 = st.columns([0.8, 0.2])
-                c1.info(f"📄 {attached_file.name}")
-                # The remove button needs to be outside the form to trigger a rerun immediately
-            
-        # Add a file uploader for new attachments
         new_attachments = st.file_uploader("Add more files", accept_multiple_files=True, key=f"uploader_{form_key}")
         
         send_button = st.form_submit_button("🚀 Send Application")
 
-    # Handle removal outside the form
     if st.session_state.attachments:
-        indices_to_remove = []
-        for i, attached_file in enumerate(st.session_state.attachments):
-             if st.button(f"Remove '{attached_file.name}'", key=f"remove_{i}_{form_key}"):
-                 indices_to_remove.append(i)
-        
-        if indices_to_remove:
-            st.session_state.attachments = [f for i, f in enumerate(st.session_state.attachments) if i not in indices_to_remove]
-            st.rerun()
-
+        st.write("Current Attachments:")
+        # Loop backwards to avoid index errors when removing items
+        for i in range(len(st.session_state.attachments) - 1, -1, -1):
+            attached_file = st.session_state.attachments[i]
+            c1, c2 = st.columns([0.8, 0.2])
+            c1.info(f"📄 {attached_file.name}")
+            if c2.button(f"Remove", key=f"remove_{i}_{form_key}_{attached_file.name}"):
+                st.session_state.attachments.pop(i)
+                st.rerun()
 
     if send_button:
-        # Combine old and new attachments
         current_attachments = st.session_state.attachments + (new_attachments or [])
         if not current_attachments:
-            st.warning("You must have at least one attachment (your CV).")
-            return
+            st.warning("You must have at least one attachment (your CV)."); return
 
         if send_email_logic(st.session_state.gmail_service, contact_email, subject, body, current_attachments):
             email_record = {
@@ -359,9 +337,9 @@ def render_application_form(db, is_manual=False):
             if not is_manual:
                 update_user_data(db, {"applied_jobs": firestore.ArrayUnion([str(details['job_id'])])})
                 db.collection(DB_COLLECTION).document(DB_DOCUMENT_ID).update({f'stats.sent_count': firestore.Increment(1)})
-                st.session_state.current_job_id = None # Move to next job
+                st.session_state.current_job_id = None
             else:
-                st.session_state.manual_email_content = None # Clear manual form
+                st.session_state.manual_email_content = None
             
             st.balloons()
             st.rerun()
@@ -372,23 +350,18 @@ def render_application_form(db, is_manual=False):
 st.set_page_config(layout="wide")
 st.title("🇨🇭 Swiss Assistenzarzt Job Application Bot")
 
-# --- Initialize Firebase & Session State ---
 if 'step' not in st.session_state:
     st.session_state.step = "auth"
     st.session_state.gmail_service = None
     st.session_state.cv_content = None
     st.session_state.attachments = []
     st.session_state.current_job_id = None
-    # ... other initializations
     st.session_state.generated_email_content = None
     st.session_state.manual_email_content = None
 
 db = get_firestore_db()
-if not db:
-    st.error("Fatal Error: Could not connect to Firebase database. Check your credentials.")
-    st.stop()
+if not db: st.stop()
 
-# --- Authentication Step ---
 if st.session_state.step == "auth":
     st.header("Step 1: Authorize Your Gmail Account")
     if st.button("Authorize Gmail"):
@@ -396,10 +369,8 @@ if st.session_state.step == "auth":
             st.session_state.gmail_service = gmail_authenticate()
         if st.session_state.gmail_service:
             st.session_state.step = "upload_cv"
-            st.success("✅ Gmail authorized successfully!")
             st.rerun()
 
-# --- CV Upload Step ---
 elif st.session_state.step == "upload_cv":
     st.header("Step 2: Upload Your Documents")
     user_data = get_user_data(db)
@@ -409,32 +380,41 @@ elif st.session_state.step == "upload_cv":
         st.session_state.step = "main_app"
         st.rerun()
 
-    uploaded_files = st.file_uploader("Upload your CV (first file) and other attachments.", accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Upload your CV (must be the first file) and other attachments.", accept_multiple_files=True)
     if uploaded_files:
-        if st.button("Process Uploaded Files"):
-            st.session_state.attachments = uploaded_files
-            cv_file = uploaded_files[0]
-            with st.spinner("Reading CV..."):
-                cv_text = extract_text_from_pdf(cv_file)
-            
+        st.session_state.attachments = uploaded_files
+        cv_file = uploaded_files[0]
+        with st.spinner("Reading CV..."): cv_text = extract_text_from_pdf(cv_file)
+        
+        if cv_text:
             lang = st.radio("Is the CV in English (needs translation) or German?", ("English", "German"))
-            if "English" in lang:
-                with st.spinner("Translating CV..."):
-                    translated = translate_cv_text(cv_text)
-                    st.session_state.cv_content = translated
-                    update_user_data(db, {"translated_cv": translated})
-            else:
-                st.session_state.cv_content = cv_text
+            if st.button("Confirm and Proceed"):
+                if "English" in lang:
+                    with st.spinner("Translating CV..."):
+                        translated = translate_cv_text(cv_text)
+                        st.session_state.cv_content = translated
+                        update_user_data(db, {"translated_cv": translated})
+                else:
+                    st.session_state.cv_content = cv_text
+                
+                st.success("CV processed and saved!")
+                st.session_state.step = "main_app"
+                st.rerun()
             
-            st.success("CV processed!")
-            st.session_state.step = "main_app"
-            st.rerun()
-            
-# --- Main Application View ---
 elif st.session_state.step == "main_app":
+    if not st.session_state.cv_content:
+        # Attempt to load from DB one more time if not in state
+        user_data = get_user_data(db)
+        if user_data.get("translated_cv"):
+             st.session_state.cv_content = user_data["translated_cv"]
+        else:
+            st.warning("CV has not been processed. Please return to the upload step.")
+            if st.button("Go to Upload Step"):
+                st.session_state.step = "upload_cv"
+                st.rerun()
+            st.stop()
+
     user_data = get_user_data(db)
-    
-    # --- Sidebar for Navigation & Stats ---
     with st.sidebar:
         st.header("Navigation")
         app_page = st.radio("Go to", ["Job Finder", "Add Manual Job", "Dashboard"])
@@ -445,11 +425,7 @@ elif st.session_state.step == "main_app":
         st.metric("Emails Sent", stats.get("sent_count", 0))
         st.metric("Jobs Skipped", stats.get("skipped_count", 0))
 
-    # --- Page Routing ---
-    if app_page == "Job Finder":
-        render_job_finder(db)
-    elif app_page == "Dashboard":
-        render_dashboard(db)
-    elif app_page == "Add Manual Job":
-        render_manual_job_page(db)
+    if app_page == "Job Finder": render_job_finder(db)
+    elif app_page == "Dashboard": render_dashboard(db)
+    elif app_page == "Add Manual Job": render_manual_job_page(db)
 
