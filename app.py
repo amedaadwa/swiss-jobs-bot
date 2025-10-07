@@ -50,9 +50,8 @@ def get_firestore_db():
 
 def gmail_authenticate():
     """
-    Handles Google Authentication (Streamlit Cloud compatible).
-    Uses console flow instead of opening a browser.
-    Returns (gmail_service, user_email).
+    Handles Google Authentication using the Web Application OAuth client.
+    Works seamlessly on Streamlit Cloud (no manual code entry).
     """
     db = get_firestore_db()
     creds = None
@@ -64,34 +63,44 @@ def gmail_authenticate():
             return None, None
 
         client_config = json.loads(client_secret_json)
-        flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
 
-        st.info("Click the link below to log in to Google and paste the authorization code here 👇")
+        # Use Web Flow
+        flow = Flow.from_client_config(
+            client_config,
+            scopes=SCOPES,
+            redirect_uri="https://swiss-jobs-bot.streamlit.app/"
+        )
 
-        auth_url, _ = flow.authorization_url(prompt='consent')
-        st.markdown(f"[🔑 Authorize with Google]({auth_url})")
+        # STEP 1: Show sign-in button if no "code" parameter yet
+        params = st.query_params
+        if "code" not in params:
+            auth_url, _ = flow.authorization_url(
+                access_type="offline",
+                include_granted_scopes="true",
+                prompt="consent"
+            )
+            st.markdown(f"[🔐 Sign in with Google]({auth_url})")
+            return None, None
 
-        auth_code = st.text_input("Paste the authorization code here:")
+        # STEP 2: Handle the redirected URL with ?code=...
+        code_param = params["code"][0] if isinstance(params["code"], list) else params["code"]
+        flow.fetch_token(authorization_response=f"https://swiss-jobs-bot.streamlit.app/?code={code_param}")
+        creds = flow.credentials
 
-        if auth_code:
-            flow.fetch_token(code=auth_code)
-            creds = flow.credentials
+        # Build Gmail service
+        service = build("gmail", "v1", credentials=creds)
+        profile = service.users().getProfile(userId="me").execute()
+        user_email = profile["emailAddress"]
 
-            service = build("gmail", "v1", credentials=creds)
-            profile = service.users().getProfile(userId="me").execute()
-            user_email = profile["emailAddress"]
+        # Optional: Save token in Firestore
+        if db:
+            token_b64 = base64.b64encode(pickle.dumps(creds)).decode("utf-8")
+            db.collection(DB_COLLECTION).document(user_email).set(
+                {"gmail_token": token_b64}, merge=True
+            )
 
-            # Save token in Firestore (optional)
-            if db:
-                token_b64 = base64.b64encode(pickle.dumps(creds)).decode("utf-8")
-                db.collection(DB_COLLECTION).document(user_email).set(
-                    {"gmail_token": token_b64}, merge=True
-                )
-
-            st.success(f"✅ Authenticated as {user_email}")
-            return service, user_email
-
-        return None, None
+        st.success(f"✅ Authenticated as {user_email}")
+        return service, user_email
 
     except Exception as e:
         st.error(f"Authentication failed: {e}")
