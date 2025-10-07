@@ -376,7 +376,7 @@ if not st.session_state.user_email:
         st.link_button("Login with Google", auth_url)
     
     # Check for authorization code in query params
-    query_params = st.experimental_get_query_params()
+    query_params = st.query_params
     if "code" in query_params:
         code = query_params["code"][0]
         try:
@@ -390,7 +390,7 @@ if not st.session_state.user_email:
             token_b64 = base64.b64encode(pickle.dumps(creds)).decode('utf-8')
             st.session_state.db.collection(DB_COLLECTION).document(user_email).set({'gmail_token': token_b64}, merge=True)
             cookie_manager.set('user_email', user_email, expires_at=datetime.now() + timedelta(days=30))
-            st.experimental_set_query_params()  # Clear query params
+            st.query_params.clear()  # Clear query params
             st.session_state.gmail_service = service
             st.session_state.user_email = user_email
             st.success(f"Logged in as {user_email}")
