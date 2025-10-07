@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import Flow
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import base64, pickle, json
 from PyPDF2 import PdfReader
@@ -49,62 +49,18 @@ def get_firestore_db():
         return None
 
 def gmail_authenticate():
-    """
-    Handles Google Authentication using the Web Application OAuth client.
-    Works seamlessly on Streamlit Cloud (no manual code entry).
-    """
-    db = get_firestore_db()
-    creds = None
+    client_secret_json = os.getenv("GOOGLE_CLIENT_SECRET_JSON")
+    if not client_secret_json:
+        st.error("Google client secret JSON not found.")
+        return None
+    client_config = json.loads(client_secret_json)
 
-    try:
-        client_secret_json = os.getenv("GOOGLE_CLIENT_SECRET_JSON")
-        if not client_secret_json:
-            st.error("Google client secret JSON not found.")
-            return None, None
+    flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+    creds = flow.run_local_server(port=0)  # ✅ Uses localhost redirect flow
 
-        client_config = json.loads(client_secret_json)
+    service = build("gmail", "v1", credentials=creds)
+    return service
 
-        # Use Web Flow
-        flow = Flow.from_client_config(
-            client_config,
-            scopes=SCOPES,
-            redirect_uri="https://swiss-jobs-bot.streamlit.app/"
-        )
-
-        # STEP 1: Show sign-in button if no "code" parameter yet
-        params = st.query_params
-        if "code" not in params:
-            auth_url, _ = flow.authorization_url(
-                access_type="offline",
-                include_granted_scopes="true",
-                prompt="consent"
-            )
-            st.markdown(f"[🔐 Sign in with Google]({auth_url})")
-            return None, None
-
-        # STEP 2: Handle the redirected URL with ?code=...
-        code_param = params["code"][0] if isinstance(params["code"], list) else params["code"]
-        flow.fetch_token(authorization_response=f"https://swiss-jobs-bot.streamlit.app/?code={code_param}")
-        creds = flow.credentials
-
-        # Build Gmail service
-        service = build("gmail", "v1", credentials=creds)
-        profile = service.users().getProfile(userId="me").execute()
-        user_email = profile["emailAddress"]
-
-        # Optional: Save token in Firestore
-        if db:
-            token_b64 = base64.b64encode(pickle.dumps(creds)).decode("utf-8")
-            db.collection(DB_COLLECTION).document(user_email).set(
-                {"gmail_token": token_b64}, merge=True
-            )
-
-        st.success(f"✅ Authenticated as {user_email}")
-        return service, user_email
-
-    except Exception as e:
-        st.error(f"Authentication failed: {e}")
-        return None, None
 # ================================
 # API & HELPER FUNCTIONS (No significant changes here)
 # ================================
