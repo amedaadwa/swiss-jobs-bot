@@ -6,15 +6,16 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from PyPDF2 import PdfReader
 from google.oauth2 import service_account
 from google.cloud import firestore
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from openai import OpenAI
 import io
+import extra_streamlit_components as stx  # NEW: For cookie management
 
 # ================================
 # SETUP & CONFIGURATION
@@ -25,6 +26,9 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 CSV_FILE = "Assistenzarzt_Jobs_CH__Combined_Final.csv"
 SCOPES = ["https://www.googleapis.com/auth/gmail.send", "https://www.googleapis.com/auth/userinfo.email"]
 DB_COLLECTION = "job_applications_v3"
+
+# NEW: Define redirect URI (update for your hosted app URL; use environment variable if possible)
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8501")  # e.g., "https://your-app.streamlit.app" for hosted
 
 # ================================
 # FIREBASE AUTHENTICATION (Unchanged)
@@ -44,43 +48,38 @@ def get_firestore_db():
         return None
 
 # ================================
-# GMAIL AUTHENTICATION (Modified)
+# GMAIL AUTHENTICATION (Major Update: Web-based flow for hosted env)
 # ================================
-def gmail_authenticate():
-    """
-    Handles Google Authentication for Gmail API.
-    Returns the Gmail service and the user's email address.
-    Stores OAuth tokens in Firestore per user.
-    """
-    db = get_firestore_db()
-    creds = None
-    user_email = None
-
+def get_auth_url():
     try:
-        # Load client configuration from environment variable or file
         client_secret_json = os.getenv("GOOGLE_CLIENT_SECRET_JSON")
         if not client_secret_json:
-            st.error("Google client secret JSON not found. Please set GOOGLE_CLIENT_SECRET_JSON.")
-            return None, None
-
+            st.error("Google client secret JSON not found.")
+            return None
         client_config = json.loads(client_secret_json)
-        flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-        creds = flow.run_local_server(port=0)
-
-        # Build Gmail service and get user email
-        service = build("gmail", "v1", credentials=creds)
-        profile = service.users().getProfile(userId="me").execute()
-        user_email = profile['emailAddress']
-
-        # Save OAuth token to Firestore for the user
-        if db:
-            token_b64 = base64.b64encode(pickle.dumps(creds)).decode('utf-8')
-            db.collection(DB_COLLECTION).document(user_email).set({'gmail_token': token_b64}, merge=True)
-
-        return service, user_email
+        flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+        auth_url, _ = flow.authorization_url(access_type='offline', include_granted_scopes='true')
+        return auth_url
     except Exception as e:
-        st.error(f"Authentication failed: {e}")
-        return None, None
+        st.error(f"Failed to generate auth URL: {e}")
+        return None
+
+def load_creds(db, user_email):
+    try:
+        doc = db.collection(DB_COLLECTION).document(user_email).get()
+        if doc.exists:
+            data = doc.to_dict()
+            token_b64 = data.get('gmail_token')
+            if token_b64:
+                creds = pickle.loads(base64.b64decode(token_b64))
+                if creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                    new_token_b64 = base64.b64encode(pickle.dumps(creds)).decode('utf-8')
+                    db.collection(DB_COLLECTION).document(user_email).set({'gmail_token': new_token_b64}, merge=True)
+                return creds
+    except Exception as e:
+        st.error(f"Failed to load/refresh credentials: {e}")
+    return None
 
 # ================================
 # API & HELPER FUNCTIONS (Unchanged)
@@ -151,7 +150,7 @@ def send_email_logic(service, user_email, to_email, subject, body, attachments):
         st.success(f"✅ Application successfully sent to {to_email}!")
         return True
     except Exception as e:
-        st.error(f"An error occurred while sending the email: {e}")
+        st.error(f"An error occurred while sending the email: {e}. If credentials expired, please re-authenticate.")
         return False
 
 def extract_text_from_pdf(file_bytes):
@@ -185,7 +184,7 @@ def save_sent_email(db, user_email, email_data):
     db.collection(DB_COLLECTION).document(user_email).collection("sent_emails").add(email_data)
 
 # ================================
-# UI PAGE FUNCTIONS (Modified for send_email_logic)
+# UI PAGE FUNCTIONS (Unchanged)
 # ================================
 def render_dashboard(db, user_email):
     st.header("📊 Dashboard: Sent Applications")
@@ -333,7 +332,7 @@ def process_and_save_files(db, user_email, files):
         st.rerun()
 
 # ================================
-# MAIN APP LAYOUT & LOGIC
+# MAIN APP LAYOUT & LOGIC (Updated for web-based auth)
 # ================================
 st.set_page_config(layout="wide")
 st.title("🇨🇭 Swiss Assistenzarzt Job Application Bot")
@@ -355,17 +354,51 @@ if not st.session_state.db:
     st.error("Could not connect to the database. The app cannot continue.")
     st.stop()
 
+# NEW: Cookie manager for persistence
+cookie_manager = stx.CookieManager()
+
 # Primary App Flow
+if not st.session_state.user_email:
+    # Try loading from cookie
+    user_email_cookie = cookie_manager.get('user_email')
+    if user_email_cookie:
+        creds = load_creds(st.session_state.db, user_email_cookie)
+        if creds:
+            st.session_state.gmail_service = build("gmail", "v1", credentials=creds)
+            st.session_state.user_email = user_email_cookie
+            st.rerun()
+
 if not st.session_state.user_email:
     st.header("Step 1: Authorize Your Gmail Account")
     st.info("This app needs permission to send emails on your behalf and view your email address to create your profile.")
-    if st.button("Login with Google"):
-        service, email = gmail_authenticate()
-        if service and email:
+    
+    # Generate and show auth link
+    auth_url = get_auth_url()
+    if auth_url:
+        st.link_button("Login with Google", auth_url)
+    
+    # Check for authorization code in query params (callback)
+    query_params = st.experimental_get_query_params()
+    if "code" in query_params:
+        code = query_params["code"][0]
+        try:
+            client_config = json.loads(os.getenv("GOOGLE_CLIENT_SECRET_JSON"))
+            flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+            flow.fetch_token(code=code)
+            creds = flow.credentials
+            service = build("gmail", "v1", credentials=creds)
+            profile = service.users().getProfile(userId="me").execute()
+            user_email = profile['emailAddress']
+            token_b64 = base64.b64encode(pickle.dumps(creds)).decode('utf-8')
+            st.session_state.db.collection(DB_COLLECTION).document(user_email).set({'gmail_token': token_b64}, merge=True)
+            cookie_manager.set('user_email', user_email, expires_at=datetime.now() + timedelta(days=30))
+            st.experimental_set_query_params()  # Clear query params
             st.session_state.gmail_service = service
-            st.session_state.user_email = email
-            st.success(f"Logged in as {email}")
+            st.session_state.user_email = user_email
+            st.success(f"Logged in as {user_email}")
             st.rerun()
+        except Exception as e:
+            st.error(f"Authentication failed: {e}")
 else:
     user_data = get_user_data(st.session_state.db, st.session_state.user_email)
     st.session_state.cv_text = user_data.get("cv_text")
