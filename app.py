@@ -50,38 +50,49 @@ def get_firestore_db():
 
 def gmail_authenticate():
     """
-    Handles Google OAuth via local server (InstalledAppFlow).
-    Works on Streamlit Cloud as long as the credentials are set correctly.
+    Handles Google OAuth via console flow.
+    ✅ Works on Streamlit Cloud (no browser required).
     """
     db = get_firestore_db()
     creds = None
     user_email = None
 
-    # 1️⃣ Load Google client secrets
     client_secret_json = os.getenv("GOOGLE_CLIENT_SECRET_JSON")
     if not client_secret_json:
         st.error("❌ Google client secret JSON not found in environment.")
         return None, None
 
     client_config = json.loads(client_secret_json)
-
-    # 2️⃣ OAuth flow (local server)
     flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-    creds = flow.run_local_server(port=0)
 
-    # 3️⃣ Build Gmail service and get authenticated email
-    service = build("gmail", "v1", credentials=creds)
-    profile = service.users().getProfile(userId="me").execute()
-    user_email = profile["emailAddress"]
+    # Generate auth URL for user
+    auth_url, _ = flow.authorization_url(prompt='consent')
+    st.markdown(f"[🔑 Click here to log in with Google]({auth_url})")
+    auth_code = st.text_input("Paste the authorization code here:")
 
-    # 4️⃣ Save credentials to Firestore under user_email
-    if db and user_email and creds:
-        token_b64 = base64.b64encode(pickle.dumps(creds)).decode('utf-8')
-        db.collection(DB_COLLECTION).document(user_email).set(
-            {"gmail_token": token_b64}, merge=True
-        )
+    if auth_code:
+        try:
+            flow.fetch_token(code=auth_code)
+            creds = flow.credentials
+            service = build("gmail", "v1", credentials=creds)
+            profile = service.users().getProfile(userId="me").execute()
+            user_email = profile["emailAddress"]
 
-    return service, user_email
+            # Save token to Firestore
+            if db and user_email and creds:
+                token_b64 = base64.b64encode(pickle.dumps(creds)).decode('utf-8')
+                db.collection(DB_COLLECTION).document(user_email).set(
+                    {"gmail_token": token_b64}, merge=True
+                )
+
+            st.success(f"✅ Logged in as {user_email}")
+            return service, user_email
+
+        except Exception as e:
+            st.error(f"Authentication failed: {e}")
+            return None, None
+
+    return None, None
 
 
 # ================================
