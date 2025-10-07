@@ -15,30 +15,31 @@ import json
 from datetime import datetime, timedelta
 from openai import OpenAI
 import io
-import extra_streamlit_components as stx  # NEW: For cookie management
+import extra_streamlit_components as stx
 
 # ================================
 # SETUP & CONFIGURATION
 # ================================
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 CSV_FILE = "Assistenzarzt_Jobs_CH__Combined_Final.csv"
 SCOPES = ["https://www.googleapis.com/auth/gmail.send", "https://www.googleapis.com/auth/userinfo.email"]
 DB_COLLECTION = "job_applications_v3"
 
-# NEW: Define redirect URI (update for your hosted app URL; use environment variable if possible)
-REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8501")  # e.g., "https://your-app.streamlit.app" for hosted
+# Dynamically determine redirect URI based on environment
+IS_LOCAL = os.getenv("STREAMLIT_LOCAL", "false").lower() == "true"
+REDIRECT_URI = "http://localhost:8501" if IS_LOCAL else "https://swiss-jobs-bot.streamlit.app"
 
 # ================================
-# FIREBASE AUTHENTICATION (Unchanged)
+# FIREBASE AUTHENTICATION
 # ================================
 @st.cache_resource
 def get_firestore_db():
     try:
-        firebase_creds_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+        firebase_creds_json = st.secrets.get("FIREBASE_SERVICE_ACCOUNT_JSON")
         if not firebase_creds_json:
-            st.error("Firebase service account JSON not found.")
+            st.error("Firebase service account JSON not found in secrets.")
             return None
         creds_dict = json.loads(firebase_creds_json)
         creds = service_account.Credentials.from_service_account_info(creds_dict)
@@ -48,13 +49,13 @@ def get_firestore_db():
         return None
 
 # ================================
-# GMAIL AUTHENTICATION (Major Update: Web-based flow for hosted env)
+# GMAIL AUTHENTICATION
 # ================================
 def get_auth_url():
     try:
-        client_secret_json = os.getenv("GOOGLE_CLIENT_SECRET_JSON")
+        client_secret_json = st.secrets.get("GOOGLE_CLIENT_SECRET_JSON")
         if not client_secret_json:
-            st.error("Google client secret JSON not found.")
+            st.error("Google client secret JSON not found in secrets.")
             return None
         client_config = json.loads(client_secret_json)
         flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
@@ -82,7 +83,7 @@ def load_creds(db, user_email):
     return None
 
 # ================================
-# API & HELPER FUNCTIONS (Unchanged)
+# API & HELPER FUNCTIONS
 # ================================
 def call_openai_api(prompt, system_message="You are a helpful assistant."):
     try:
@@ -130,15 +131,12 @@ Act as a professional medical career advisor in Switzerland. Create a compelling
     return {'subject': "Bewerbung für die ausgeschriebene Position", 'body': response or "Could not generate email body."}
 
 def send_email_logic(service, user_email, to_email, subject, body, attachments):
-    """
-    Sends an email using the Gmail API from the authenticated user's email address.
-    """
     try:
         message = EmailMessage()
         message.set_content(body)
         message["To"] = to_email
         message["Subject"] = subject
-        message["From"] = user_email  # Set From to the authenticated user's email
+        message["From"] = user_email
 
         for file_wrapper in attachments:
             file_content = base64.b64decode(file_wrapper['content_b64'])
@@ -168,7 +166,7 @@ def translate_cv_text(text):
     return call_openai_api(prompt, "You are an expert translator specializing in medical and professional documents.")
 
 # ================================
-# DATABASE FUNCTIONS (Unchanged)
+# DATABASE FUNCTIONS
 # ================================
 def get_user_data(db, user_email):
     if not db or not user_email: return {}
@@ -184,7 +182,7 @@ def save_sent_email(db, user_email, email_data):
     db.collection(DB_COLLECTION).document(user_email).collection("sent_emails").add(email_data)
 
 # ================================
-# UI PAGE FUNCTIONS (Unchanged)
+# UI PAGE FUNCTIONS
 # ================================
 def render_dashboard(db, user_email):
     st.header("📊 Dashboard: Sent Applications")
@@ -332,7 +330,7 @@ def process_and_save_files(db, user_email, files):
         st.rerun()
 
 # ================================
-# MAIN APP LAYOUT & LOGIC (Updated for web-based auth)
+# MAIN APP LAYOUT & LOGIC
 # ================================
 st.set_page_config(layout="wide")
 st.title("🇨🇭 Swiss Assistenzarzt Job Application Bot")
@@ -354,7 +352,7 @@ if not st.session_state.db:
     st.error("Could not connect to the database. The app cannot continue.")
     st.stop()
 
-# NEW: Cookie manager for persistence
+# Cookie manager for persistence
 cookie_manager = stx.CookieManager()
 
 # Primary App Flow
@@ -377,12 +375,12 @@ if not st.session_state.user_email:
     if auth_url:
         st.link_button("Login with Google", auth_url)
     
-    # Check for authorization code in query params (callback)
+    # Check for authorization code in query params
     query_params = st.experimental_get_query_params()
     if "code" in query_params:
         code = query_params["code"][0]
         try:
-            client_config = json.loads(os.getenv("GOOGLE_CLIENT_SECRET_JSON"))
+            client_config = json.loads(st.secrets["GOOGLE_CLIENT_SECRET_JSON"])
             flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
             flow.fetch_token(code=code)
             creds = flow.credentials
