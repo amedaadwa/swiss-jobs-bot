@@ -55,41 +55,33 @@ def gmail_authenticate():
     """
     db = get_firestore_db()
     creds = None
+    user_email = None
 
-    # 1️⃣ Try to load existing credentials from Firestore
-    if db:
-        doc_ref = db.collection(DB_COLLECTION).document(DB_DOCUMENT_ID)
-        doc = doc_ref.get()
-        if doc.exists and 'gmail_token' in doc.to_dict():
-            try:
-                creds = pickle.loads(base64.b64decode(doc.to_dict()['gmail_token']))
-            except Exception as e:
-                st.warning(f"⚠️ Failed to load saved Gmail credentials: {e}")
+    # 1️⃣ Load Google client secrets
+    client_secret_json = os.getenv("GOOGLE_CLIENT_SECRET_JSON")
+    if not client_secret_json:
+        st.error("❌ Google client secret JSON not found in environment.")
+        return None, None
 
-    # 2️⃣ If no valid creds, do OAuth
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            client_secret_json = os.getenv("GOOGLE_CLIENT_SECRET_JSON")
-            if not client_secret_json:
-                st.error("❌ Google client secret JSON not found in environment.")
-                return None
-            client_config = json.loads(client_secret_json)
-            flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-            creds = flow.run_local_server(port=0)  # 👈 This launches a temporary local server for OAuth
+    client_config = json.loads(client_secret_json)
 
-        # 3️⃣ Save credentials back to Firestore
-        if db and creds:
-            token_b64 = base64.b64encode(pickle.dumps(creds)).decode('utf-8')
-            db.collection(DB_COLLECTION).document(DB_DOCUMENT_ID).set(
-                {'gmail_token': token_b64}, merge=True
-            )
+    # 2️⃣ OAuth flow (local server)
+    flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+    creds = flow.run_local_server(port=0)
 
-    # 4️⃣ Return the authenticated Gmail service
-    if creds:
-        return build("gmail", "v1", credentials=creds)
-    return None
+    # 3️⃣ Build Gmail service and get authenticated email
+    service = build("gmail", "v1", credentials=creds)
+    profile = service.users().getProfile(userId="me").execute()
+    user_email = profile["emailAddress"]
+
+    # 4️⃣ Save credentials to Firestore under user_email
+    if db and user_email and creds:
+        token_b64 = base64.b64encode(pickle.dumps(creds)).decode('utf-8')
+        db.collection(DB_COLLECTION).document(user_email).set(
+            {"gmail_token": token_b64}, merge=True
+        )
+
+    return service, user_email
 
 
 # ================================
